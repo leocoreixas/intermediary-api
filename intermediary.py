@@ -15,9 +15,37 @@ import logging
 import requests
 import datetime
 import json
+import random
+
+from os import environ
+import traceback
+import logging
+import requests
+import json
+from eth_abi.abi import encode
+from eth_abi_ext import decode_packed
+
+logging.basicConfig(level="INFO")
+logger = logging.getLogger(__name__)
+
+rollup_server = "http://127.0.0.1:5004"
+network = "localhost"
+
+logger.info(f"HTTP rollup_server url is {rollup_server}")
+logger.info(f"Network is {network}")
+
+# Function selector to be called during the execution of a voucher that transfers funds,
+# which corresponds to the first 4 bytes of the Keccak256-encoded result of "transfer(address,uint256)"
+TRANSFER_FUNCTION_SELECTOR = b'\xa9\x05\x9c\xbb'
+
+# Setup contracts addresses
+ETHERPortalFile = open(f'./deployments/{network}/EtherPortal.json')
+etherPortal = json.load(ETHERPortalFile)
+
 
 CLIENTS = []
 OFFERS = []
+BALANCES = {}
 STATUS_CODES = [
     "accepted",
     "refused",
@@ -99,7 +127,7 @@ class Offer:
                 values = offer.get_values()
                 offers_values.append(values)
         return offers_values
-    
+
     def getAllOffers():
         offers_values = []
         for offer in OFFERS:
@@ -119,6 +147,12 @@ class Offer:
         offer = Offer.getOffer(payload['id'])
         if not offer:
             return False
+        if payload['user_id'] not in BALANCES:
+            BALANCES[payload['user_id']] = 0
+        BALANCES[payload['user_id']] += payload['offer_value']
+        if payload['proposer_id'] not in BALANCES:
+            BALANCES[payload['proposer_id']] = 0
+        BALANCES[payload['proposer_id']] -= payload['offer_value']
         Offer.updateOffer(payload['id'])
         Offer.updateOffer(payload['original_offer_id'])
 
@@ -164,6 +198,18 @@ class Offer:
 
         return newOffer
 
+    def generate_mock_offers(num_offers):
+        statuses = ['pending', 'reoffered', 'accepted']
+        for i in range(num_offers):
+            status = random.choice(statuses)
+            offer_data = (i, f"Offer {i}", f"Description for Offer {i}", 1, 1000, 2, 50.0, None, status, False,
+                          "2023-08-02 12:00:00", "2023-08-02 13:00:00", "2023-08-02 14:00:00", "Country", "State", "City",
+                          "Street", "12345", "123", "10A", "1")
+            offer_instance = Offer(*offer_data)
+            OFFERS.append(offer_instance)
+
+        return OFFERS
+
 
 class Client:
     def __init__(self, id, name, account_number, balance):
@@ -200,6 +246,33 @@ class Client:
         return CLIENTS
 
 
+def get_balance(data):
+    result = []
+    for balance in BALANCES:
+        if balance == data["user_id"]:
+            result.append({"amount": BALANCES[balance], "type": "BALANCE"})
+            break
+    return result or [{"amount": 0, "type": "BALANCE"}]
+
+
+def add_or_update_balance(data):
+    binary = bytes.fromhex(data)
+    try:
+        decoded = decode_packed(['address', 'uint256'], binary)
+        user_id = decoded[0]
+        amount = decoded[1]
+        if user_id not in BALANCES:
+            BALANCES[user_id] = 0
+        BALANCES[user_id] += amount
+
+    except Exception as e:
+        msg = "Payload does not conform to ETHER deposit ABI"
+        logger.error(f"{msg}\n{traceback.format_exc()}")
+        return reject_input(msg, data["payload"])
+
+    return 'accept'
+
+
 logging.basicConfig(level="INFO")
 logger = logging.getLogger(__name__)
 
@@ -207,16 +280,22 @@ rollup_server = environ["ROLLUP_HTTP_SERVER_URL"]
 logger.info(f"HTTP rollup_server url is {rollup_server}")
 
 
+def reject_input(msg, payload):
+    logger.error(msg)
+    response = requests.post(rollup_server + "/report",
+                             json={"payload": payload})
+    logger.info(
+        f"Received report status {response.status_code} body {response.content}")
+    return "reject"
+
+
 def select_function_advance(payload):
     function_id = int(payload["function_id"])
-    logger.info("select_function_advance" + str(function_id))
-
     function_map = {
         0: lambda: Client.create_client(payload),
         1: lambda: Offer.offer_proposal(payload),
         2: lambda: Offer.accept_proposal(payload),
         3: lambda: Offer.reoffer(payload),
-        # 4: lambda: Offer.reject_proposal(int(payload_obj["input_list"][0]), float(payload_obj["input_list"][1])),
     }
 
     function = function_map.get(function_id)
@@ -232,8 +311,8 @@ def select_function_inspect(payload):
         0: Client.getClients,
         1: Offer.getOffersPending,
         2: Offer.getReOffers,
-        3: Offer.getAllOffers
-        # 2: lambda: Client.getClient(int(inputFormat[1])),
+        3: Offer.getAllOffers,
+        4: lambda: get_balance(payload),
     }
 
     function = function_map.get(function_id)
@@ -288,20 +367,25 @@ def default(obj):
         return offer_dict
 
 
-def handle_advance(data):  # geralmente dados persistente no blockchain
-    decode = hex2str(data["payload"])
-    payload = json.loads(decode)
-    function_id = int(payload["function_id"])
-    response = select_function_advance(payload)
-    needToNotice = payload["needToNotice"]
-    enconde = str2hex(decode) if function_id == 2 else str2hex(
-        json.dumps(default(response)))
-    notice = {"payload": enconde}
-    if needToNotice:
-        response = requests.post(rollup_server + "/notice", json=notice)
-        logger.info(
-            f"Received notice status {response.status_code} body {response.content}")
-    return "accept"
+def handle_advance(data):
+    try:
+        if data["metadata"]["msg_sender"].lower() == etherPortal['address'].lower():
+            return add_or_update_balance(data["payload"][2:])
+        decode = hex2str(data["payload"])
+        payload = json.loads(decode)
+        function_id = int(payload["function_id"])
+        response = select_function_advance(payload)
+        needToNotice = payload["needToNotice"]
+        enconde = str2hex(decode) if function_id == 2 else str2hex(
+            json.dumps(default(response)))
+        notice = {"payload": enconde}
+        if needToNotice:
+            response = requests.post(rollup_server + "/notice", json=notice)
+            logger.info(
+                f"Received notice status {response.status_code} body {response.content}")
+        return "accept"
+    except Exception as e:
+        return "reject"
 
 
 def handle_inspect(data):
@@ -333,12 +417,5 @@ while True:
     else:
         rollup_request = response.json()
         logger.info(rollup_request["request_type"])
-        data = rollup_request["data"]
-        if "metadata" in data:
-            metadata = data["metadata"]
-            if metadata["epoch_index"] == 0 and metadata["input_index"] == 0:
-                rollup_address = metadata["msg_sender"]
-                logger.info(f"Captured rollup address: {rollup_address}")
-                continue
         handler = handlers[rollup_request["request_type"]]
         finish["status"] = handler(rollup_request["data"])
