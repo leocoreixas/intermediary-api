@@ -38,6 +38,10 @@ logger.info(f"Network is {network}")
 # which corresponds to the first 4 bytes of the Keccak256-encoded result of "transfer(address,uint256)"
 TRANSFER_FUNCTION_SELECTOR = b'\xa9\x05\x9c\xbb'
 
+# Function selector to be called during the execution of a voucher that transfers funds,
+# which corresponds to the first 4 bytes of the Keccak256-encoded result of "withdrawEther(address,uint256)"
+WITHDRAW_FUNCTION_SELECTOR = b'R/h\x15'
+
 # Setup contracts addresses
 ETHERPortalFile = open(f'./deployments/{network}/EtherPortal.json')
 etherPortal = json.load(ETHERPortalFile)
@@ -46,6 +50,7 @@ etherPortal = json.load(ETHERPortalFile)
 CLIENTS = []
 OFFERS = []
 BALANCES = {}
+VOUCHERS = {}
 STATUS_CODES = [
     "accepted",
     "refused",
@@ -57,7 +62,7 @@ STATUS_CODES = [
 class Offer:
     def __init__(self, id, name, description, user_id, original_offer_id, proposer_id,
                  offer_value, image, status, ended, created_at, ended_at, updated_at,
-                 country, state, city, street, zipcode, number, complement, selectedType):
+                 country, state, city, street, zipcode, number, complement, selectedType, productType):
         self.id = id
         self.name = name
         self.description = description
@@ -79,6 +84,7 @@ class Offer:
         self.number = number
         self.complement = complement
         self.selectedType = selectedType
+        self.productType = productType
 
     def get_values(self):
         return {
@@ -103,6 +109,7 @@ class Offer:
             'number': self.number,
             'complement': self.complement,
             'selectedType': self.selectedType,
+            'productType': self.productType,
         }
 
     def createOffer(data):
@@ -157,6 +164,25 @@ class Offer:
         Offer.updateOffer(payload['original_offer_id'])
 
         return True
+    
+    def generate_withdrawal(payload):
+        user_id = payload['user_id']
+        if user_id not in BALANCES:
+            return False
+        BALANCES[user_id] -= payload['balance']
+        
+        amount = payload['balance']
+        address = payload['address']
+        
+        if user_id not in VOUCHERS:
+            VOUCHERS[user_id] = 0
+        VOUCHERS[user_id] += amount
+        
+        # Generate the payload for the voucher
+        withdraw_payload = WITHDRAW_FUNCTION_SELECTOR + encode(['address', 'uint256'], [address, amount])
+        voucher = {"destination": rollup_address, "payload": "0x" + withdraw_payload.hex()}
+        requests.post(rollup_server + "/voucher", json=voucher)
+        return True
 
     def reject_proposal(payload):
         offer = Offer.getOffer(payload['id'])
@@ -184,7 +210,7 @@ class Offer:
         newOffer = Offer(len(OFFERS), payload["name"], payload["description"], payload["user_id"], payload['original_offer_id'],
                          payload["proposer_id"], payload["offer_value"], payload["image"], payload["status"], payload["ended"],
                          payload["created_at"], payload["ended_at"], payload["updated_at"], payload["country"], payload["state"], payload["city"],
-                         payload["street"], payload["zipcode"], payload["number"], payload["complement"], payload["selectedType"])
+                         payload["street"], payload["zipcode"], payload["number"], payload["complement"], payload["selectedType"], payload["productType"])
         Offer.createOffer(newOffer)
 
         return newOffer
@@ -193,7 +219,7 @@ class Offer:
         newOffer = Offer(len(OFFERS), payload["name"], payload["description"], payload["user_id"], payload['original_offer_id'],
                          payload["proposer_id"], payload["offer_value"], payload["image"], payload["status"], payload["ended"],
                          payload["created_at"], payload["ended_at"], payload["updated_at"], payload["country"], payload["state"], payload["city"],
-                         payload["street"], payload["zipcode"], payload["number"], payload["complement"], payload["selectedType"])
+                         payload["street"], payload["zipcode"], payload["number"], payload["complement"], payload["selectedType"], payload["productType"])
         Offer.createOffer(newOffer)
 
         return newOffer
@@ -252,10 +278,14 @@ def get_balance(data):
         if balance == data["user_id"]:
             result.append({"amount": BALANCES[balance], "type": "BALANCE"})
             break
+    for voucher in VOUCHERS:
+        if voucher == data["user_id"]:
+            result.append({"amount": voucher["amount"], "type": "VOUCHER"})
+            break
     return result or [{"amount": 0, "type": "BALANCE"}]
 
 
-def add_or_update_balance(data):
+def add_balance(data):
     binary = bytes.fromhex(data)
     try:
         decoded = decode_packed(['address', 'uint256'], binary)
@@ -264,6 +294,23 @@ def add_or_update_balance(data):
         if user_id not in BALANCES:
             BALANCES[user_id] = 0
         BALANCES[user_id] += amount
+
+    except Exception as e:
+        msg = "Payload does not conform to ETHER deposit ABI"
+        logger.error(f"{msg}\n{traceback.format_exc()}")
+        return reject_input(msg, data["payload"])
+
+    return 'accept'
+
+def discount_balance(data):
+    binary = bytes.fromhex(data)
+    try:
+        decoded = decode_packed(['address', 'uint256'], binary)
+        user_id = decoded[0]
+        amount = decoded[1]
+        if user_id not in BALANCES:
+            BALANCES[user_id] = 0
+        BALANCES[user_id] -= amount
 
     except Exception as e:
         msg = "Payload does not conform to ETHER deposit ABI"
@@ -296,6 +343,7 @@ def select_function_advance(payload):
         1: lambda: Offer.offer_proposal(payload),
         2: lambda: Offer.accept_proposal(payload),
         3: lambda: Offer.reoffer(payload),
+        4: lambda: Offer.generate_withdrawal(payload),
     }
 
     function = function_map.get(function_id)
@@ -363,6 +411,7 @@ def default(obj):
             "number": obj.number,
             "complement": obj.complement,
             "selectedType": obj.selectedType,
+            "productType": obj.productType,
         }
         return offer_dict
 
@@ -370,7 +419,7 @@ def default(obj):
 def handle_advance(data):
     try:
         if data["metadata"]["msg_sender"].lower() == etherPortal['address'].lower():
-            return add_or_update_balance(data["payload"][2:])
+            return add_balance(data["payload"][2:])
         decode = hex2str(data["payload"])
         payload = json.loads(decode)
         function_id = int(payload["function_id"])
